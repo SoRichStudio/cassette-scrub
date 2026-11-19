@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cassette-scrub"
-version = "0.1.0"
+version = "0.2.0"
 description = "Scrub sensitive headers, query parameters, tokens, and PII from VCR.py YAML and JSON cassettes."
 requires-python = ">=3.9"
 dependencies = [
@@ -20,6 +20,8 @@ dev = [
 
 [project.scripts]
 cassette-scrub = "cassette_scrub.cli:main"
+cassette-scrub-gui = "cassette_scrub.gui:launch_gui"
+cassette-scrub-mcp = "cassette_scrub.mcp_server:run_mcp_server"
 
 [tool.setuptools.packages.find]
 include = ["cassette_scrub*"]
