@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import base64
 import copy
+import difflib
 import json
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import yaml
 
 from cassette_scrub.types import Finding, ScrubConfig, ScrubResult
 
@@ -90,13 +94,35 @@ SENSITIVE_BODY_KEYS: frozenset[str] = frozenset(
     }
 )
 
+_WEBHOOK_REGEX = re.compile(
+    "|".join(
+        [
+            r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+",
+            r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+",
+        ]
+    )
+)
+
 _TOKEN_REGEX = re.compile(
     "|".join(
         [
+            (
+                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----"
+                r"[\s\S]*?"
+                r"-----END (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----"
+            ),
+            r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+",
+            r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+",
+            r"(?<![A-Za-z0-9])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}",
             r"sk-ant-[A-Za-z0-9_-]{6,}",
             r"(?<![A-Za-z0-9])sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{10,}",
             r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{20,})",
+            r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}",
+            r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}",
+            r"(?<![A-Za-z0-9])ya29\.[0-9A-Za-z_-]{10,}",
+            r"(?<![A-Za-z0-9])SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",
             r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])",
+            r"(?<![A-Za-z0-9])SK[0-9a-fA-F]{32}(?![A-Za-z0-9])",
             (
                 r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{4,}\."
                 r"(?:eyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?"
@@ -113,6 +139,8 @@ _EMAIL_REGEX = re.compile(
 _FORM_BODY_REGEX = re.compile(
     r"^[A-Za-z0-9_.~%\[\]-]+=[^&\s]*(?:&[A-Za-z0-9_.~%\[\]-]+=[^&\s]*)*$"
 )
+
+_PLACEHOLDER_REGEX = re.compile(r"<REDACTED(?:_EMAIL)?>")
 
 
 def _safe_preview(raw: str, replacement: str = REDACTED) -> str:
@@ -142,26 +170,94 @@ def _is_redacted_auth_value(value: str) -> bool:
     return False
 
 
+def _is_allowlisted(value: str, allowlist: frozenset[str]) -> bool:
+    """Return True if stripped value is present in the allowlist."""
+    if not allowlist:
+        return False
+    return value.strip() in allowlist
+
+
+def _is_allowlisted_auth_value(value: str, allowlist: frozenset[str]) -> bool:
+    """Return True if an auth header value or its Bearer/Basic token is allowlisted."""
+    if not allowlist:
+        return False
+    stripped = value.strip()
+    if stripped in allowlist:
+        return True
+    lower = stripped.lower()
+    for prefix in ("bearer ", "basic "):
+        if lower.startswith(prefix):
+            rest = stripped[len(prefix) :].strip()
+            if rest in allowlist:
+                return True
+    return False
+
+
+def _compile_custom_patterns(patterns: Any) -> tuple[re.Pattern[str], ...]:
+    """Safely compile non-empty custom regex strings, ignoring invalid regexes."""
+    if not patterns:
+        return ()
+    compiled: list[re.Pattern[str]] = []
+    for raw in patterns:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            compiled.append(re.compile(raw))
+        except re.error:
+            continue
+    return tuple(compiled)
+
+
 def _scrub_text_patterns(
-    text: str, scrub_pii: bool
+    text: str,
+    scrub_pii: bool,
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> tuple[str, list[tuple[str, str]]]:
-    """Scrub email (when enabled) and token regex matches in free text."""
+    """Scrub email (when enabled), built-in token, and custom regex matches."""
     matches: list[tuple[str, str]] = []
     updated = text
 
     if scrub_pii:
 
         def _replace_email(match: re.Match[str]) -> str:
-            matches.append((match.group(0), REDACTED_EMAIL))
+            raw = match.group(0)
+            if _is_allowlisted(raw, allowlist):
+                return raw
+            matches.append((raw, REDACTED_EMAIL))
             return REDACTED_EMAIL
 
         updated = _EMAIL_REGEX.sub(_replace_email, updated)
 
     def _replace_token(match: re.Match[str]) -> str:
-        matches.append((match.group(0), REDACTED))
+        raw = match.group(0)
+        if _is_allowlisted(raw, allowlist):
+            return raw
+        matches.append((raw, REDACTED))
         return REDACTED
 
     updated = _TOKEN_REGEX.sub(_replace_token, updated)
+
+    for pattern in custom_patterns:
+        placeholder_spans = [m.span() for m in _PLACEHOLDER_REGEX.finditer(updated)]
+
+        def _replace_custom(
+            match: re.Match[str],
+            spans: list[tuple[int, int]] = placeholder_spans,
+        ) -> str:
+            raw = match.group(0)
+            if not raw:
+                return raw
+            m_start, m_end = match.span()
+            if any(m_start < p_end and p_start < m_end for p_start, p_end in spans):
+                return raw
+            if _is_allowlisted(raw, allowlist):
+                return raw
+            matches.append((raw, REDACTED))
+            return REDACTED
+
+        updated = pattern.sub(_replace_custom, updated)
+
     return updated, matches
 
 
@@ -184,10 +280,12 @@ def _record_pattern_findings(
         )
 
 
-def _scrub_auth_header_value(value: str) -> tuple[str, str] | None:
+def _scrub_auth_header_value(
+    value: str, allowlist: frozenset[str] = frozenset()
+) -> tuple[str, str] | None:
     """Scrub an Authorization/Proxy-Authorization header preserving Bearer/Basic prefix."""
     stripped = value.strip()
-    if not stripped or stripped == REDACTED:
+    if not stripped or stripped == REDACTED or _is_allowlisted(stripped, allowlist):
         return None
 
     lower = stripped.lower()
@@ -195,7 +293,7 @@ def _scrub_auth_header_value(value: str) -> tuple[str, str] | None:
         if lower.startswith(prefix_kw):
             prefix_len = len(prefix_kw)
             rest = stripped[prefix_len:].strip()
-            if not rest or rest == REDACTED:
+            if not rest or rest == REDACTED or _is_allowlisted(rest, allowlist):
                 return None
             new_val = f"{stripped[: prefix_len - 1]} {REDACTED}"
             return new_val, _safe_preview(rest, new_val)
@@ -203,9 +301,11 @@ def _scrub_auth_header_value(value: str) -> tuple[str, str] | None:
     return REDACTED, _safe_preview(stripped, REDACTED)
 
 
-def _scrub_cookie_header_value(value: str) -> tuple[str, str] | None:
+def _scrub_cookie_header_value(
+    value: str, allowlist: frozenset[str] = frozenset()
+) -> tuple[str, str] | None:
     """Scrub Cookie header values while preserving cookie key names."""
-    if _is_already_redacted(value):
+    if _is_already_redacted(value) or _is_allowlisted(value, allowlist):
         return None
 
     parts = value.split(";")
@@ -220,7 +320,11 @@ def _scrub_cookie_header_value(value: str) -> tuple[str, str] | None:
         if "=" in item:
             name, cval = item.split("=", 1)
             cval_stripped = cval.strip()
-            if cval_stripped in ("", REDACTED):
+            if (
+                cval_stripped in ("", REDACTED)
+                or _is_allowlisted(cval_stripped, allowlist)
+                or _is_allowlisted(item, allowlist)
+            ):
                 new_parts.append(item)
             else:
                 if not first_raw:
@@ -228,7 +332,7 @@ def _scrub_cookie_header_value(value: str) -> tuple[str, str] | None:
                 new_parts.append(f"{name.strip()}={REDACTED}")
                 changed = True
         else:
-            if item == REDACTED:
+            if item == REDACTED or _is_allowlisted(item, allowlist):
                 new_parts.append(item)
             else:
                 if not first_raw:
@@ -241,9 +345,11 @@ def _scrub_cookie_header_value(value: str) -> tuple[str, str] | None:
     return "; ".join(new_parts), _safe_preview(first_raw, REDACTED)
 
 
-def _scrub_set_cookie_header_value(value: str) -> tuple[str, str] | None:
+def _scrub_set_cookie_header_value(
+    value: str, allowlist: frozenset[str] = frozenset()
+) -> tuple[str, str] | None:
     """Scrub leading name=value in Set-Cookie while preserving attributes."""
-    if _is_already_redacted(value):
+    if _is_already_redacted(value) or _is_allowlisted(value, allowlist):
         return None
 
     parts = value.split(";")
@@ -253,12 +359,16 @@ def _scrub_set_cookie_header_value(value: str) -> tuple[str, str] | None:
     if "=" in first:
         name, cval = first.split("=", 1)
         cval_stripped = cval.strip()
-        if cval_stripped in ("", REDACTED):
+        if (
+            cval_stripped in ("", REDACTED)
+            or _is_allowlisted(cval_stripped, allowlist)
+            or _is_allowlisted(first, allowlist)
+        ):
             return None
         new_first = f"{name.strip()}={REDACTED}"
         raw_secret = cval_stripped
     else:
-        if first in ("", REDACTED):
+        if first in ("", REDACTED) or _is_allowlisted(first, allowlist):
             return None
         new_first = REDACTED
         raw_secret = first
@@ -276,12 +386,14 @@ def _scrub_single_header_string(
     interaction_index: int,
     file_path: str,
     findings: list[Finding],
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> tuple[str, bool]:
     """Scrub one header string and append Finding(s) if modified."""
     h_lower = header_name.lower()
 
     if h_lower in ("authorization", "proxy-authorization"):
-        res = _scrub_auth_header_value(value)
+        res = _scrub_auth_header_value(value, allowlist)
         if res is None:
             return value, False
         new_val, preview = res
@@ -296,7 +408,7 @@ def _scrub_single_header_string(
         return new_val, True
 
     if h_lower == "cookie":
-        res = _scrub_cookie_header_value(value)
+        res = _scrub_cookie_header_value(value, allowlist)
         if res is None:
             return value, False
         new_val, preview = res
@@ -311,7 +423,7 @@ def _scrub_single_header_string(
         return new_val, True
 
     if h_lower == "set-cookie":
-        res = _scrub_set_cookie_header_value(value)
+        res = _scrub_set_cookie_header_value(value, allowlist)
         if res is None:
             return value, False
         new_val, preview = res
@@ -326,7 +438,7 @@ def _scrub_single_header_string(
         return new_val, True
 
     if h_lower in sensitive_headers:
-        if _is_already_redacted(value):
+        if _is_already_redacted(value) or _is_allowlisted(value, allowlist):
             return value, False
         findings.append(
             Finding(
@@ -341,7 +453,12 @@ def _scrub_single_header_string(
     if h_lower in SKIP_NON_SENSITIVE_HEADERS:
         return value, False
 
-    new_val, matches = _scrub_text_patterns(value, scrub_pii)
+    if _is_allowlisted(value, allowlist):
+        return value, False
+
+    new_val, matches = _scrub_text_patterns(
+        value, scrub_pii, custom_patterns, allowlist
+    )
     if not matches:
         return value, False
     _record_pattern_findings(matches, file_path, interaction_index, location, findings)
@@ -356,6 +473,8 @@ def _scrub_headers(
     sensitive_headers: frozenset[str],
     scrub_pii: bool,
     findings: list[Finding],
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> None:
     """Scrub request or response headers in place."""
     if not isinstance(headers, dict):
@@ -379,6 +498,8 @@ def _scrub_headers(
                     interaction_index=interaction_index,
                     file_path=file_path,
                     findings=findings,
+                    custom_patterns=custom_patterns,
+                    allowlist=allowlist,
                 )
                 if changed:
                     raw_values[i] = new_item
@@ -392,6 +513,8 @@ def _scrub_headers(
                 interaction_index=interaction_index,
                 file_path=file_path,
                 findings=findings,
+                custom_patterns=custom_patterns,
+                allowlist=allowlist,
             )
             if changed:
                 headers[header_name] = new_item
@@ -405,6 +528,8 @@ def _scrub_urlencoded_pairs(
     file_path: str,
     scrub_pii: bool,
     findings: list[Finding],
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> str | None:
     """Scrub urlencoded key/value pairs; return rebuilt string only if modified."""
     pairs = parse_qsl(raw, keep_blank_values=True)
@@ -417,7 +542,7 @@ def _scrub_urlencoded_pairs(
     for key, val in pairs:
         location = f"{base_location}.{key}"
         if key.lower() in sensitive_keys:
-            if _is_already_redacted(val):
+            if _is_already_redacted(val) or _is_allowlisted(val, allowlist):
                 updated_pairs.append((key, val))
             else:
                 updated_pairs.append((key, REDACTED))
@@ -431,7 +556,12 @@ def _scrub_urlencoded_pairs(
                     )
                 )
         else:
-            new_val, matches = _scrub_text_patterns(val, scrub_pii)
+            if _is_allowlisted(val, allowlist):
+                updated_pairs.append((key, val))
+                continue
+            new_val, matches = _scrub_text_patterns(
+                val, scrub_pii, custom_patterns, allowlist
+            )
             if matches:
                 updated_pairs.append((key, new_val))
                 modified = True
@@ -453,10 +583,12 @@ def _scrub_uri(
     sensitive_query_keys: frozenset[str],
     scrub_pii: bool,
     findings: list[Finding],
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> None:
     """Scrub sensitive query parameters (and URI userinfo/path tokens) on request['uri']."""
     uri = request.get("uri")
-    if not isinstance(uri, str) or not uri:
+    if not isinstance(uri, str) or not uri or _is_allowlisted(uri, allowlist):
         return
 
     parts = urlsplit(uri)
@@ -465,7 +597,11 @@ def _scrub_uri(
     new_query = parts.query
     uri_modified = False
 
-    if parts.password is not None and not _is_already_redacted(parts.password):
+    if (
+        parts.password is not None
+        and not _is_already_redacted(parts.password)
+        and not _is_allowlisted(parts.password, allowlist)
+    ):
         host_part = parts.netloc.rsplit("@", 1)[-1]
         user_part = parts.username or ""
         new_netloc = f"{user_part}:{REDACTED}@{host_part}"
@@ -479,8 +615,36 @@ def _scrub_uri(
         )
         uri_modified = True
 
-    if parts.path:
-        scrubbed_path, path_matches = _scrub_text_patterns(parts.path, scrub_pii)
+    webhook_scrubbed_base: str | None = None
+    if parts.scheme and parts.netloc:
+        base_uri = urlunsplit((parts.scheme, parts.netloc, new_path, "", ""))
+        webhook_matches: list[tuple[str, str]] = []
+
+        def _replace_webhook(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            if _is_allowlisted(raw, allowlist):
+                return raw
+            webhook_matches.append((raw, REDACTED))
+            return REDACTED
+
+        candidate_base = _WEBHOOK_REGEX.sub(_replace_webhook, base_uri)
+        if webhook_matches:
+            webhook_scrubbed_base = candidate_base
+            uri_modified = True
+            _record_pattern_findings(
+                webhook_matches,
+                file_path,
+                interaction_index,
+                "request.uri",
+                findings,
+            )
+
+    if webhook_scrubbed_base is None and parts.path and not _is_allowlisted(
+        parts.path, allowlist
+    ):
+        scrubbed_path, path_matches = _scrub_text_patterns(
+            parts.path, scrub_pii, custom_patterns, allowlist
+        )
         if path_matches:
             new_path = scrubbed_path
             uri_modified = True
@@ -497,15 +661,22 @@ def _scrub_uri(
             file_path=file_path,
             scrub_pii=scrub_pii,
             findings=findings,
+            custom_patterns=custom_patterns,
+            allowlist=allowlist,
         )
         if rebuilt_query is not None:
             new_query = rebuilt_query
             uri_modified = True
 
     if uri_modified:
-        request["uri"] = urlunsplit(
-            (parts.scheme, new_netloc, new_path, new_query, parts.fragment)
-        )
+        if webhook_scrubbed_base is not None:
+            request["uri"] = urlunsplit(
+                ("", "", webhook_scrubbed_base, new_query, parts.fragment)
+            )
+        else:
+            request["uri"] = urlunsplit(
+                (parts.scheme, new_netloc, new_path, new_query, parts.fragment)
+            )
 
 
 def _get_content_type(headers: Any) -> str:
@@ -559,6 +730,8 @@ def _scrub_json_node(
     scrub_pii: bool,
     findings: list[Finding],
     force_redact: bool = False,
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> tuple[Any, bool]:
     """Recursively scrub a decoded JSON value (dict, list, or scalar)."""
     if isinstance(node, dict):
@@ -572,10 +745,17 @@ def _scrub_json_node(
                 if val is None or isinstance(val, bool):
                     continue
                 if isinstance(val, str):
-                    if _is_already_redacted(val) or (
-                        isinstance(key, str)
-                        and key.lower() == "authorization"
-                        and _is_redacted_auth_value(val)
+                    if (
+                        _is_already_redacted(val)
+                        or _is_allowlisted(val, allowlist)
+                        or (
+                            isinstance(key, str)
+                            and key.lower() == "authorization"
+                            and (
+                                _is_redacted_auth_value(val)
+                                or _is_allowlisted_auth_value(val, allowlist)
+                            )
+                        )
                     ):
                         continue
                     node[key] = REDACTED
@@ -589,6 +769,8 @@ def _scrub_json_node(
                         )
                     )
                 elif isinstance(val, (int, float)):
+                    if _is_allowlisted(str(val), allowlist):
+                        continue
                     node[key] = REDACTED
                     changed = True
                     findings.append(
@@ -609,6 +791,8 @@ def _scrub_json_node(
                         scrub_pii,
                         findings,
                         force_redact=True,
+                        custom_patterns=custom_patterns,
+                        allowlist=allowlist,
                     )
                     if child_changed:
                         node[key] = new_child
@@ -623,6 +807,8 @@ def _scrub_json_node(
                     scrub_pii,
                     findings,
                     force_redact=False,
+                    custom_patterns=custom_patterns,
+                    allowlist=allowlist,
                 )
                 if child_changed:
                     node[key] = new_child
@@ -642,6 +828,8 @@ def _scrub_json_node(
                 scrub_pii,
                 findings,
                 force_redact=force_redact,
+                custom_patterns=custom_patterns,
+                allowlist=allowlist,
             )
             if item_changed:
                 node[idx] = new_item
@@ -650,7 +838,7 @@ def _scrub_json_node(
 
     if isinstance(node, str):
         if force_redact:
-            if _is_already_redacted(node):
+            if _is_already_redacted(node) or _is_allowlisted(node, allowlist):
                 return node, False
             findings.append(
                 Finding(
@@ -662,7 +850,12 @@ def _scrub_json_node(
             )
             return REDACTED, True
 
-        new_str, matches = _scrub_text_patterns(node, scrub_pii)
+        if _is_allowlisted(node, allowlist):
+            return node, False
+
+        new_str, matches = _scrub_text_patterns(
+            node, scrub_pii, custom_patterns, allowlist
+        )
         if not matches:
             return node, False
         _record_pattern_findings(
@@ -671,6 +864,8 @@ def _scrub_json_node(
         return new_str, True
 
     if force_redact and isinstance(node, (int, float)) and not isinstance(node, bool):
+        if _is_allowlisted(str(node), allowlist):
+            return node, False
         findings.append(
             Finding(
                 file_path=file_path,
@@ -693,9 +888,11 @@ def _scrub_body_text(
     sensitive_body_keys: frozenset[str],
     scrub_pii: bool,
     findings: list[Finding],
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> tuple[str, bool]:
     """Scrub a UTF-8 body string (JSON, form-urlencoded, or plain text)."""
-    if not text:
+    if not text or _is_allowlisted(text, allowlist):
         return text, False
 
     stripped = text.lstrip()
@@ -716,6 +913,8 @@ def _scrub_body_text(
                 sensitive_body_keys,
                 scrub_pii,
                 findings,
+                custom_patterns=custom_patterns,
+                allowlist=allowlist,
             )
             if not changed:
                 return text, False
@@ -734,12 +933,16 @@ def _scrub_body_text(
             file_path=file_path,
             scrub_pii=scrub_pii,
             findings=findings,
+            custom_patterns=custom_patterns,
+            allowlist=allowlist,
         )
         if rebuilt_form is not None:
             return rebuilt_form, True
         return text, False
 
-    new_text, matches = _scrub_text_patterns(text, scrub_pii)
+    new_text, matches = _scrub_text_patterns(
+        text, scrub_pii, custom_patterns, allowlist
+    )
     if not matches:
         return text, False
     _record_pattern_findings(
@@ -756,6 +959,8 @@ def _scrub_body(
     sensitive_body_keys: frozenset[str],
     scrub_pii: bool,
     findings: list[Finding],
+    custom_patterns: tuple[re.Pattern[str], ...] = (),
+    allowlist: frozenset[str] = frozenset(),
 ) -> None:
     """Scrub request or response body (str, bytes, or {'string': ...}) and sync Content-Length."""
     raw_body = message.get("body")
@@ -792,6 +997,8 @@ def _scrub_body(
         sensitive_body_keys=sensitive_body_keys,
         scrub_pii=scrub_pii,
         findings=findings,
+        custom_patterns=custom_patterns,
+        allowlist=allowlist,
     )
     if not modified:
         return
@@ -823,6 +1030,12 @@ def scrub_cassette(
     sensitive_body_keys = SENSITIVE_BODY_KEYS | {
         k.strip().lower() for k in config.extra_body_keys if k.strip()
     }
+    custom_patterns = _compile_custom_patterns(config.custom_patterns)
+    allowlist = frozenset(
+        item.strip()
+        for item in config.allowlist
+        if isinstance(item, str) and item.strip()
+    )
 
     interactions = scrubbed.get("interactions")
     if isinstance(interactions, list):
@@ -839,6 +1052,8 @@ def scrub_cassette(
                     sensitive_query_keys=sensitive_query_keys,
                     scrub_pii=config.scrub_pii,
                     findings=findings,
+                    custom_patterns=custom_patterns,
+                    allowlist=allowlist,
                 )
                 _scrub_headers(
                     headers=request.get("headers"),
@@ -848,6 +1063,8 @@ def scrub_cassette(
                     sensitive_headers=sensitive_headers,
                     scrub_pii=config.scrub_pii,
                     findings=findings,
+                    custom_patterns=custom_patterns,
+                    allowlist=allowlist,
                 )
                 _scrub_body(
                     message=request,
@@ -857,6 +1074,8 @@ def scrub_cassette(
                     sensitive_body_keys=sensitive_body_keys,
                     scrub_pii=config.scrub_pii,
                     findings=findings,
+                    custom_patterns=custom_patterns,
+                    allowlist=allowlist,
                 )
 
             response = interaction.get("response")
@@ -869,6 +1088,8 @@ def scrub_cassette(
                     sensitive_headers=sensitive_headers,
                     scrub_pii=config.scrub_pii,
                     findings=findings,
+                    custom_patterns=custom_patterns,
+                    allowlist=allowlist,
                 )
                 _scrub_body(
                     message=response,
@@ -878,6 +1099,8 @@ def scrub_cassette(
                     sensitive_body_keys=sensitive_body_keys,
                     scrub_pii=config.scrub_pii,
                     findings=findings,
+                    custom_patterns=custom_patterns,
+                    allowlist=allowlist,
                 )
 
     modified = bool(findings)
@@ -886,3 +1109,45 @@ def scrub_cassette(
         findings=findings,
         updated_data=scrubbed if modified else None,
     )
+
+
+def _json_default(value: Any) -> str:
+    """Safely encode bytes values when serializing cassettes to JSON."""
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return base64.b64encode(value).decode("ascii")
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _serialize_cassette(data: dict[str, Any], fmt: str) -> str:
+    """Serialize a cassette dictionary into YAML or JSON text."""
+    if fmt == "yaml":
+        return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    if fmt == "json":
+        return json.dumps(data, indent=2, default=_json_default) + "\n"
+    raise ValueError(f"Unsupported cassette format: {fmt!r}")
+
+
+def format_cassette_diff(
+    original_data: dict[str, Any],
+    updated_data: dict[str, Any],
+    fmt: str,
+    file_path: str = "cassette",
+) -> str:
+    """Generate a unified diff between original and updated cassette dictionaries."""
+    orig_text = _serialize_cassette(original_data, fmt)
+    upd_text = _serialize_cassette(updated_data, fmt)
+    diff_lines = list(
+        difflib.unified_diff(
+            orig_text.splitlines(),
+            upd_text.splitlines(),
+            fromfile=f"a/{file_path}",
+            tofile=f"b/{file_path}",
+            lineterm="",
+        )
+    )
+    if not diff_lines:
+        return ""
+    return "\n".join(diff_lines) + "\n"
