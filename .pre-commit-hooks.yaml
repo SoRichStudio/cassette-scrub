@@ -1,0 +1,15 @@
+- id: cassette-scrub-check
+  name: cassette-scrub-check
+  description: Check VCR.py YAML and JSON cassettes for unscrubbed secrets and PII.
+  entry: cassette-scrub --check
+  language: python
+  types: [file]
+  files: '(cassette|cassettes|vcr).*\.(yaml|yml|json)$'
+
+- id: cassette-scrub-fix
+  name: cassette-scrub-fix
+  description: Scrub secrets and PII from VCR.py YAML and JSON cassettes in place.
+  entry: cassette-scrub --fix
+  language: python
+  types: [file]
+  files: '(cassette|cassettes|vcr).*\.(yaml|yml|json)$'
