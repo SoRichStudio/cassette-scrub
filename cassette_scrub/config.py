@@ -23,6 +23,28 @@ def _normalize_string_set(raw: Any) -> set[str]:
     }
 
 
+def _normalize_exact_set(raw: Any) -> set[str]:
+    """Normalize a TOML sequence of exact allowlist strings preserving case."""
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {
+        str(item).strip()
+        for item in raw
+        if isinstance(item, str) and item.strip()
+    }
+
+
+def _normalize_pattern_tuple(raw: Any) -> tuple[str, ...]:
+    """Normalize a TOML sequence of custom regex strings into a tuple."""
+    if not isinstance(raw, (list, tuple, set)):
+        return ()
+    return tuple(
+        str(item).strip()
+        for item in raw
+        if isinstance(item, str) and item.strip()
+    )
+
+
 def _find_pyproject(start_dir: Path) -> Path | None:
     """Locate the nearest pyproject.toml starting from start_dir and walking upward."""
     base = start_dir.resolve()
@@ -75,4 +97,6 @@ def load_config(start_dir: Path | None = None, scrub_pii: bool = True) -> ScrubC
         extra_query_keys=_normalize_string_set(tool_cfg.get("extra_query_keys")),
         extra_body_keys=_normalize_string_set(tool_cfg.get("extra_body_keys")),
         scrub_pii=effective_scrub_pii,
+        custom_patterns=_normalize_pattern_tuple(tool_cfg.get("custom_patterns")),
+        allowlist=_normalize_exact_set(tool_cfg.get("allowlist")),
     )
