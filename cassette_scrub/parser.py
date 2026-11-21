@@ -7,19 +7,17 @@ from typing import Any, cast
 
 import yaml
 
-__all__ = ["is_vcr_cassette", "load_cassette", "dump_cassette"]
+__all__ = ["_json_default", "dump_cassette", "is_vcr_cassette", "load_cassette"]
 
-_YAML_EXTENSIONS = frozenset({".yaml", ".yml"})
+_YAML_EXTS = frozenset({".yaml", ".yml"})
 
 
 def is_vcr_cassette(data: Any) -> bool:
-    """Return True if data matches the VCR cassette schema."""
+    """Return True if data looks like a VCR.py cassette mapping."""
     if not isinstance(data, dict):
         return False
     interactions = data.get("interactions")
-    if not isinstance(interactions, list):
-        return False
-    return all(
+    return isinstance(interactions, list) and all(
         isinstance(item, dict)
         and isinstance(item.get("request"), dict)
         and isinstance(item.get("response"), dict)
@@ -28,38 +26,22 @@ def is_vcr_cassette(data: Any) -> bool:
 
 
 def load_cassette(path: Path) -> tuple[dict[str, Any] | None, str]:
-    """Load and validate a YAML or JSON VCR cassette from disk.
-
-    Returns ``(data, fmt)`` where ``fmt`` is ``"yaml"`` or ``"json"``,
-    or ``(None, "")`` if the file is missing, unsupported, malformed,
-    or not a VCR cassette.
-    """
+    """Load a YAML or JSON VCR cassette, or return ``(None, "")`` if skipped/invalid."""
     suffix = path.suffix.lower()
-    if suffix == ".json":
-        fmt = "json"
-    elif suffix in _YAML_EXTENSIONS:
-        fmt = "yaml"
-    else:
+    fmt = "json" if suffix == ".json" else ("yaml" if suffix in _YAML_EXTS else "")
+    if not fmt or not path.is_file():
         return None, ""
-
     try:
-        if not path.is_file():
-            return None, ""
-        raw_text = path.read_text(encoding="utf-8")
-        if fmt == "json":
-            data = json.loads(raw_text)
-        else:
-            data = yaml.safe_load(raw_text)
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(text) if fmt == "json" else yaml.safe_load(text)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError):
         return None, ""
-
     if not is_vcr_cassette(data):
         return None, ""
     return cast("dict[str, Any]", data), fmt
 
 
 def _json_default(value: Any) -> str:
-    """Safely encode bytes values when dumping to JSON."""
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8")
@@ -69,13 +51,12 @@ def _json_default(value: Any) -> str:
 
 
 def dump_cassette(path: Path, data: dict[str, Any], fmt: str) -> None:
-    """Write a VCR cassette dict to path in UTF-8 YAML or JSON format."""
+    """Write cassette data back to disk in YAML or JSON format."""
     if fmt == "yaml":
-        serialized = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+        out = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     elif fmt == "json":
-        serialized = json.dumps(data, indent=2, default=_json_default) + "\n"
+        out = json.dumps(data, indent=2, default=_json_default) + "\n"
     else:
         raise ValueError(f"Unsupported cassette format: {fmt!r}")
-
     with path.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(serialized)
+        handle.write(out)

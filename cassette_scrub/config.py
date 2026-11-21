@@ -12,91 +12,52 @@ else:
 from cassette_scrub.types import ScrubConfig
 
 
-def _normalize_string_set(raw: Any) -> set[str]:
-    """Normalize a TOML sequence of strings into a lowercased non-empty set."""
+def _str_list(raw: Any, *, lower: bool = False) -> list[str]:
     if not isinstance(raw, (list, tuple, set)):
-        return set()
-    return {
-        str(item).strip().lower()
-        for item in raw
-        if isinstance(item, str) and item.strip()
-    }
-
-
-def _normalize_exact_set(raw: Any) -> set[str]:
-    """Normalize a TOML sequence of exact allowlist strings preserving case."""
-    if not isinstance(raw, (list, tuple, set)):
-        return set()
-    return {
-        str(item).strip()
-        for item in raw
-        if isinstance(item, str) and item.strip()
-    }
-
-
-def _normalize_pattern_tuple(raw: Any) -> tuple[str, ...]:
-    """Normalize a TOML sequence of custom regex strings into a tuple."""
-    if not isinstance(raw, (list, tuple, set)):
-        return ()
-    return tuple(
-        str(item).strip()
-        for item in raw
-        if isinstance(item, str) and item.strip()
-    )
+        return []
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            s = item.strip()
+            out.append(s.lower() if lower else s)
+    return out
 
 
 def _find_pyproject(start_dir: Path) -> Path | None:
-    """Locate the nearest pyproject.toml starting from start_dir and walking upward."""
     base = start_dir.resolve()
     if base.is_file():
         base = base.parent
-    for directory in (base, *base.parents):
-        candidate = directory / "pyproject.toml"
+    for d in (base, *base.parents):
+        candidate = d / "pyproject.toml"
         if candidate.is_file():
             return candidate
     return None
 
 
 def load_config(start_dir: Path | None = None, scrub_pii: bool = True) -> ScrubConfig:
-    """Load [tool.cassette-scrub] configuration from the nearest pyproject.toml."""
-    base = start_dir if start_dir is not None else Path.cwd()
-    pyproject = _find_pyproject(base)
+    """Load ``[tool.cassette-scrub]`` from the nearest ``pyproject.toml``."""
+    pyproject = _find_pyproject(start_dir or Path.cwd())
     if pyproject is None:
-        return ScrubConfig(
-            extra_headers=set(),
-            extra_query_keys=set(),
-            extra_body_keys=set(),
-            scrub_pii=scrub_pii,
-        )
-
+        return ScrubConfig(scrub_pii=scrub_pii)
     try:
         with pyproject.open("rb") as handle:
             parsed = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
-        return ScrubConfig(
-            extra_headers=set(),
-            extra_query_keys=set(),
-            extra_body_keys=set(),
-            scrub_pii=scrub_pii,
-        )
+        return ScrubConfig(scrub_pii=scrub_pii)
 
-    tool_section = parsed.get("tool")
-    if not isinstance(tool_section, dict):
-        tool_cfg: dict[str, Any] = {}
-    else:
-        raw_cfg = tool_section.get("cassette-scrub")
-        tool_cfg = raw_cfg if isinstance(raw_cfg, dict) else {}
+    tool = parsed.get("tool")
+    cfg = tool.get("cassette-scrub") if isinstance(tool, dict) else None
+    if not isinstance(cfg, dict):
+        cfg = {}
 
-    config_scrub_pii = tool_cfg.get("scrub_pii", True)
-    effective_scrub_pii = (
-        bool(config_scrub_pii) if isinstance(config_scrub_pii, bool) else True
-    ) and bool(scrub_pii)
+    cfg_pii = cfg.get("scrub_pii", True)
+    effective_pii = (cfg_pii if isinstance(cfg_pii, bool) else True) and bool(scrub_pii)
 
     return ScrubConfig(
-        extra_headers=_normalize_string_set(tool_cfg.get("extra_headers")),
-        extra_query_keys=_normalize_string_set(tool_cfg.get("extra_query_keys")),
-        extra_body_keys=_normalize_string_set(tool_cfg.get("extra_body_keys")),
-        scrub_pii=effective_scrub_pii,
-        custom_patterns=_normalize_pattern_tuple(tool_cfg.get("custom_patterns")),
-        allowlist=_normalize_exact_set(tool_cfg.get("allowlist")),
+        extra_headers=set(_str_list(cfg.get("extra_headers"), lower=True)),
+        extra_query_keys=set(_str_list(cfg.get("extra_query_keys"), lower=True)),
+        extra_body_keys=set(_str_list(cfg.get("extra_body_keys"), lower=True)),
+        scrub_pii=effective_pii,
+        custom_patterns=tuple(_str_list(cfg.get("custom_patterns"))),
+        allowlist=set(_str_list(cfg.get("allowlist"))),
     )
